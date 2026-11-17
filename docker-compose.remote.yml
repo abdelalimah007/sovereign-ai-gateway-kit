@@ -1,0 +1,14 @@
+# Optional overlay: lets the gateway reach a remote endpoint (for `reasoning`).
+# Use it only after setting REASONING_API_BASE / REASONING_API_KEY / REASONING_MODEL in .env:
+#   docker compose -f docker-compose.yml -f docker-compose.remote.yml up -d
+#
+# This gives litellm a network WITH a route out. Docker alone cannot limit that
+# route to one host. For a true allow-list (one host only), put an egress proxy or
+# a firewall rule in front, for example on a Linux host:
+#   iptables -I DOCKER-USER -s <remote-egress subnet> ! -d <your endpoint IP> -j DROP
+services:
+  litellm:
+    networks: [internal, remote-egress]
+
+networks:
+  remote-egress: {}

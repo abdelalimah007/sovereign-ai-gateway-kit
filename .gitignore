@@ -1,0 +1,15 @@
+# local secrets
+.env
+.env.*
+!.env.example
+# logs and test output
+*.log
+test-output/
+# local volumes or copies of them
+volumes/
+models/
+# editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+__pycache__/

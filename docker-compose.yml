@@ -1,0 +1,128 @@
+# Sovereign AI gateway kit: one gateway (LiteLLM) in front of several local models.
+# Every image is pinned by version AND digest (see docs/pinned-versions.md).
+# Networks ("close the exits"):
+#   internal - no route out. litellm, tap, ollama and presidio-* live here only.
+#   edge     - only the `ingress` relay, so 127.0.0.1:4000 on your laptop reaches the gateway.
+#   egress   - only `model-init`, the one-shot job that downloads the models.
+name: sovereign-ai-gateway-kit
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  litellm:
+    <<: *hardening
+    image: ghcr.io/berriai/litellm-non_root:v1.109.1@sha256:e9e15fe17b66fc8cda6ff7e18914e1d452785ca404fa20336ec447152f86daba
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./gateway/trace_line.py:/app/trace_line.py:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env (cp .env.example .env)}
+      REASONING_API_BASE: ${REASONING_API_BASE:-http://tap:8080/v1}
+      REASONING_API_KEY: ${REASONING_API_KEY:-not-needed-locally}
+      REASONING_MODEL: ${REASONING_MODEL:-granite4:3b}
+      PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
+      PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
+      LITELLM_OFFLINE_MODE: "true"          # no self-initiated outbound requests (cost map, release check, tokenizers)
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"  # use the bundled cost map, never fetch it
+      LITELLM_TELEMETRY_DISABLED: "true"    # usage telemetry stays off whatever is saved elsewhere
+      DISABLE_ADMIN_UI: "True"              # the kit has no database and no UI
+      JSON_LOGS: "True"                     # one JSON object per log line
+    networks: [internal]
+    depends_on:
+      presidio-analyzer: {condition: service_healthy}
+      presidio-anonymizer: {condition: service_healthy}
+      tap: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:4000/health/readiness', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  ingress:
+    <<: *hardening
+    image: python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+    command: ["python", "-I", "/relay/relay.py"]
+    user: "65534:65534"
+    read_only: true
+    volumes:
+      - ./ingress/relay.py:/relay/relay.py:ro
+    ports:
+      - "127.0.0.1:4000:4000"   # localhost only
+    networks: [internal, edge]
+    depends_on:
+      litellm: {condition: service_started}
+
+  tap:
+    <<: *hardening
+    build: ./tap
+    read_only: true
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  ollama:
+    <<: *hardening
+    image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    read_only: true
+    tmpfs: ["/tmp"]
+    volumes:
+      - models:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: 5m
+      OLLAMA_CONTEXT_LENGTH: "4096"
+      OLLAMA_DEBUG: "0"        # default log level: no prompt bodies
+      OLLAMA_NO_CLOUD: "1"     # no remote inference or web search features
+      OLLAMA_NOPRUNE: "1"      # never delete blobs while model-init may be writing them
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  model-init:
+    image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    entrypoint: ["/bin/bash", "/scripts/pull-models.sh"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    volumes:
+      - models:/root/.ollama
+      - ./scripts/pull-models.sh:/scripts/pull-models.sh:ro
+    networks: [egress]
+
+  presidio-analyzer:
+    <<: *hardening
+    image: mcr.microsoft.com/presidio-analyzer:2.2.362@sha256:286e3fa7f3a7426e775e8564fe1870f1ba8f999d3ab8bbb8cc46a44355d9d6e9
+    read_only: true
+    tmpfs: ["/tmp"]
+    networks: [internal]
+
+  presidio-anonymizer:
+    <<: *hardening
+    image: mcr.microsoft.com/presidio-anonymizer:2.2.362@sha256:a10a12a2a613d13cf29d3ad3641e3258444dd8c90403dd644a0a114c472c2483
+    read_only: true
+    tmpfs: ["/tmp"]
+    networks: [internal]
+
+networks:
+  internal:
+    internal: true
+  edge: {}
+  egress: {}
+
+volumes:
+  models: {}   # model weights and manifests only
